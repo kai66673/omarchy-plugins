@@ -18,7 +18,9 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "workspacePath": "~/BAS/bcad-ws"
+      "workspacePath": "~/BAS/bcad-ws",
+      "vpnMode": "auto",
+      "vpnConnection": "FALT"
     },
     "schema": [
       {
@@ -26,6 +28,21 @@
         "type": "string",
         "label": "Workspace path",
         "description": "Directory containing packages.json and packages/"
+      },
+      {
+        "key": "vpnMode",
+        "type": "enum",
+        "options": ["auto", "always", "never"],
+        "defaultValue": "auto",
+        "label": "VPN mode",
+        "description": "auto: require the VPN only when a profile named vpnConnection exists on this machine (work machines without it pull/push directly); always: always check and offer to connect; never: skip VPN handling entirely"
+      },
+      {
+        "key": "vpnConnection",
+        "type": "string",
+        "defaultValue": "FALT",
+        "label": "VPN connection",
+        "description": "NetworkManager connection name used for pull/push; empty disables VPN handling"
       }
     ]
   }

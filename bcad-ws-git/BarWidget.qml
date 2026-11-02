@@ -24,15 +24,38 @@ BarWidget {
   property var panelRows: []
   property bool vpnActive: false
   property string pendingAction: ""
+  property string pendingArg: ""
   property bool vpnConfirmOpen: false
   property string vpnPhase: ""
   property string busyText: "Working…"
   readonly property bool opened: panelOpen
 
-  readonly property bool networkBusy: busy && (panelAction === "pull" || panelAction === "push")
+  // Подпись текущей вкладки / выполняемого действия для заголовка панели
+  readonly property string headerState: {
+    if (busy) {
+      if (vpnPhase !== "") return "VPN…"
+      if (branchProcess.running) return "Switching…"
+      if (panelAction === "pull") return "Pulling…"
+      if (panelAction === "push") return "Pushing…"
+      if (panelAction === "fetch") return "Fetching…"
+      if (panelAction === "status") return "Checking…"
+      if (panelAction === "branches") return "Loading…"
+      return "Working…"
+    }
+    if (panelAction === "branches") return "Branches"
+    if (panelAction === "pull") return "Pull"
+    if (panelAction === "push") return "Push"
+    if (panelAction === "fetch") return "Fetch"
+    if (panelAction === "status") return "Status"
+    return ""
+  }
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string icon: "\uf1d3"
-  readonly property string vpnConnection: "FALT"
+  readonly property string vpnConnection: String(setting("vpnConnection", "FALT")).trim()
+  readonly property string vpnMode: {
+    var mode = String(setting("vpnMode", "auto")).trim().toLowerCase()
+    return mode === "always" || mode === "never" ? mode : "auto"
+  }
   readonly property string workspacePath: expandPath(String(setting("workspacePath", "~/BAS/bcad-ws")))
   readonly property string scriptPath: decodeURIComponent(String(Qt.resolvedUrl("workspace.py")).replace(/^file:\/\//, ""))
   readonly property string packagesPath: workspacePath + "/packages.json"
@@ -42,6 +65,8 @@ BarWidget {
   property bool branchOverlayOpen: false
   property var selectedRepoData: null
   property string newBranchName: ""
+  property string overlayMessage: ""
+  property string overlayError: ""
 
   readonly property string barText: {
     if (root.vertical) return icon
@@ -76,19 +101,26 @@ BarWidget {
   function actionLabel(action) {
     if (action === "pull") return "Pull"
       if (action === "push") return "Push"
-        if (action === "status") return "Status"
-          if (action === "branches") return "Branches"
-            return action
+        if (action === "fetch") return "Fetch"
+          if (action === "status") return "Status"
+            if (action === "branches") return "Branches"
+              return action
   }
 
-  function runAction(action) {
+  function runAction(action, arg) {
     if (branchProcess.running || actionProcess.running || vpnCheckProcess.running || vpnUpProcess.running) return
       panelAction = action
       panelError = ""
       busy = true
       busyText = "Running " + actionLabel(action) + "…"
-      actionProcess.command = ["python3", root.scriptPath, action, root.workspacePath]
+      actionProcess.command = ["python3", root.scriptPath, action, root.workspacePath].concat(arg ? [String(arg)] : [])
       actionProcess.running = true
+  }
+
+  function runFetch(dest) {
+    overlayMessage = ""
+    overlayError = ""
+    requestNetworkAction("fetch", dest)
   }
 
   function switchBranch(dest, branch, create) {
@@ -106,15 +138,24 @@ BarWidget {
       branchOverlayOpen = false // Закрываем оверлей после запуска команды
   }
 
-  function requestNetworkAction(action) {
+  function requestNetworkAction(action, arg) {
     if (branchProcess.running || actionProcess.running || vpnCheckProcess.running || vpnUpProcess.running) return
+      if (vpnMode === "never" || vpnConnection === "") {
+        runAction(action, arg)
+        return
+      }
       pendingAction = action
+      pendingArg = String(arg || "")
       panelAction = action
       panelError = ""
       busy = true
-      busyText = "Checking FALT VPN…"
-      vpnPhase = "precheck"
-      vpnCheckProcess.command = ["nmcli", "-t", "-f", "NAME", "connection", "show", "--active"]
+      busyText = "Checking VPN " + vpnConnection + "…"
+      // auto: сначала проверяем, что VPN-профиль вообще настроен на этой машине
+      // (на работе FALT нет — тогда действуем напрямую). always: сразу проверяем активность.
+      vpnPhase = vpnMode === "always" ? "precheck" : "profilecheck"
+      vpnCheckProcess.command = vpnMode === "always"
+        ? ["nmcli", "-t", "-f", "NAME", "connection", "show", "--active"]
+        : ["nmcli", "-t", "-f", "NAME", "connection", "show"]
       vpnCheckProcess.running = true
   }
 
@@ -123,12 +164,12 @@ BarWidget {
       vpnConfirmOpen = false
       panelError = ""
       busy = true
-      busyText = "Connecting FALT VPN…"
-      vpnUpProcess.command = ["nmcli", "connection", "up", root.vpnConnection]
+      busyText = "Connecting VPN " + vpnConnection + "…"
+      vpnUpProcess.command = ["nmcli", "connection", "up", vpnConnection]
       vpnUpProcess.running = true
   }
 
-  function cancelVpnConfirm() { vpnConfirmOpen = false; pendingAction = ""; panelSummary = "Cancelled" }
+  function cancelVpnConfirm() { vpnConfirmOpen = false; pendingAction = ""; pendingArg = ""; panelSummary = "Cancelled" }
 
   function applyStatus(data) {
     repoRows = Array.isArray(data.rows) ? data.rows : []
@@ -150,6 +191,24 @@ BarWidget {
     panelSummary = String(data.summary || "")
     panelError = data.error ? String(data.error) : ""
     if (data.action === "status") applyStatus(data)
+  }
+
+  // Fetch внутри оверлея веток: обновляем список веток, оверлей не закрываем
+  function applyFetchResult(data) {
+    if (branchOverlayOpen && selectedRepoData) {
+      if (data.error) overlayError = String(data.error)
+        else overlayMessage = String(data.summary || "")
+      var rows = Array.isArray(data.rows) ? data.rows : []
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i].dest === selectedRepoData.dest) {
+          selectedRepoData = rows[i]
+          overlayBranchPicker.options = rows[i].branches || []
+          overlayBranchPicker.value = rows[i].branch || ""
+          break
+        }
+      }
+    }
+    refresh()
   }
 
   function parseOutput(text) {
@@ -221,14 +280,18 @@ BarWidget {
     function switchBranch(dest: string, branch: string, create: bool): void { root.switchBranch(dest, branch, create) }
     function pull(): void { root.requestNetworkAction("pull") }
     function push(): void { root.requestNetworkAction("push") }
+    function fetch(dest: string): void { root.runFetch(dest) }
     function cancelVpn(): void { root.cancelVpnConfirm() }
     function confirmVpn(): void { root.connectVpn() }
     function state(): string {
       return JSON.stringify({
         action: root.panelAction,
+        headerState: root.headerState,
         workspacePath: root.workspacePath,
         panelOpen: root.panelOpen,
         busy: root.busy,
+        vpnMode: root.vpnMode,
+        vpnConnection: root.vpnConnection,
         vpnActive: root.vpnActive,
         vpnConfirmOpen: root.vpnConfirmOpen,
         pendingAction: root.pendingAction,
@@ -265,13 +328,21 @@ BarWidget {
     stderr: StdioCollector { id: actionStderr; waitForEnd: true }
     onExited: function(exitCode) {
       root.busy = false
+      var wasFetch = root.panelAction === "fetch"
       if (exitCode !== 0) {
-        root.panelError = actionStderr.text.trim() || "workspace.py failed"
+        var failMessage = actionStderr.text.trim() || "workspace.py failed"
+        root.panelError = failMessage
+        if (wasFetch) root.overlayError = failMessage
         return
       }
       var data = root.parseOutput(actionStdout.text)
-      if (data) root.applyActionResult(data)
-        else root.panelError = "could not parse action output"
+      if (!data) {
+        root.panelError = "could not parse action output"
+        if (wasFetch) root.overlayError = "could not parse fetch output"
+        return
+      }
+      root.applyActionResult(data)
+      if (wasFetch) root.applyFetchResult(data)
     }
   }
   Process {
@@ -297,41 +368,74 @@ BarWidget {
     id: vpnCheckProcess
     stdout: StdioCollector { id: vpnCheckStdout; waitForEnd: true }
     stderr: StdioCollector { id: vpnCheckStderr; waitForEnd: true }
-    function isVpnActive() {
-      var lines = vpnCheckStdout.text.split("\n")
+    function nameListed(text, name) {
+      var lines = String(text).split("\n")
       for (var i = 0; i < lines.length; i++) {
-        if (lines[i].trim() === root.vpnConnection) return true
+        if (lines[i].trim() === name) return true
       }
       return false
     }
     onExited: function(exitCode) {
-      var active = exitCode === 0 && isVpnActive()
       var phase = root.vpnPhase
-      root.vpnActive = active
       root.vpnPhase = ""
+
+      if (phase === "profilecheck") {
+        if (exitCode !== 0) {
+          root.busy = false
+          root.pendingAction = ""
+          root.pendingArg = ""
+          root.panelError = vpnCheckStderr.text.trim() || "could not read NetworkManager connections"
+          return
+        }
+        if (!nameListed(vpnCheckStdout.text, root.vpnConnection)) {
+          // Профиля VPN на этой машине нет (рабочий вариант) — запускаем действие напрямую
+          var directAction = root.pendingAction
+          var directArg = root.pendingArg
+          root.pendingAction = ""
+          root.pendingArg = ""
+          root.busy = false
+          root.runAction(directAction, directArg)
+          return
+        }
+        root.vpnPhase = "precheck"
+        root.busyText = "Checking VPN " + root.vpnConnection + "…"
+        vpnCheckProcess.command = ["nmcli", "-t", "-f", "NAME", "connection", "show", "--active"]
+        vpnCheckProcess.running = true
+        return
+      }
+
+      var active = exitCode === 0 && nameListed(vpnCheckStdout.text, root.vpnConnection)
+      root.vpnActive = active
       if (phase === "precheck" && exitCode !== 0) {
         root.busy = false
         root.pendingAction = ""
-        root.panelError = vpnCheckStderr.text.trim() || "could not check FALT VPN"
+        root.pendingArg = ""
+        root.panelError = vpnCheckStderr.text.trim() || "could not check VPN " + root.vpnConnection
         return
       }
       if (phase === "precheck" && !active) {
         root.busy = false
         if (root.panelOpen) root.vpnConfirmOpen = true
-          else root.pendingAction = ""
+          else {
+            root.pendingAction = ""
+            root.pendingArg = ""
+          }
             return
       }
       if (phase === "postcheck" && !active) {
         root.busy = false
         root.pendingAction = ""
-        root.panelError = "FALT VPN is not active"
+        root.pendingArg = ""
+        root.panelError = "VPN " + root.vpnConnection + " is not active"
         return
       }
       if (phase === "precheck" || phase === "postcheck") {
         var action = root.pendingAction
+        var arg = root.pendingArg
         root.pendingAction = ""
+        root.pendingArg = ""
         root.busy = false
-        root.runAction(action)
+        root.runAction(action, arg)
       }
     }
   }
@@ -343,11 +447,12 @@ BarWidget {
       if (exitCode !== 0) {
         root.busy = false
         root.pendingAction = ""
-        root.panelError = vpnUpStderr.text.trim() || "could not connect FALT VPN"
+        root.pendingArg = ""
+        root.panelError = vpnUpStderr.text.trim() || "could not connect VPN " + root.vpnConnection
         return
       }
       root.vpnPhase = "postcheck"
-      root.busyText = "Waiting for FALT VPN…"
+      root.busyText = "Waiting for VPN " + root.vpnConnection + "…"
       vpnCheckProcess.command = ["nmcli", "-t", "-f", "NAME", "connection", "show", "--active"]
       vpnCheckProcess.running = true
     }
@@ -390,7 +495,7 @@ BarWidget {
         width: parent.width
         spacing: Style.space(6)
         Text {
-          width: parent.width - headerSpinner.width - parent.spacing
+          width: parent.width - headerStateText.width - parent.spacing
           text: "BCAD workspace"
           color: Color.foreground
           font.family: Style.font.family
@@ -399,19 +504,13 @@ BarWidget {
           elide: Text.ElideRight
         }
         Text {
-          id: headerSpinner
-          visible: root.networkBusy
-          width: visible ? implicitWidth : 0
-          text: "<U+F0996>"
-          color: Color.accent
-          font.family: Style.font.family
-          font.pixelSize: Style.font.body
+          id: headerStateText
           anchors.verticalCenter: parent.verticalCenter
-          RotationAnimator on rotation {
-            running: root.networkBusy
-            from: 0; to: 360; duration: 800
-            loops: Animation.Infinite
-          }
+          width: implicitWidth // пустой текст даёт нулевую ширину без отдельной видимости
+          text: root.headerState
+          color: root.busy ? Color.accent : Color.muted
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
         }
       }
       Text {
@@ -539,6 +638,8 @@ BarWidget {
                   if (root.panelAction === "branches") {
                     root.selectedRepoData = modelData
                     root.newBranchName = ""
+                    root.overlayMessage = ""
+                    root.overlayError = ""
 
                     // Сначала принудительно выставляем значения для элементов управления в оверлее,
                     // чтобы Dropdown не залипал на старых данных
@@ -608,10 +709,10 @@ BarWidget {
             anchors.verticalCenter: parent.verticalCenter
           }
 
-          // Новая кнопка Fetch в оверлее
+          // Кнопка Fetch в оверлее
           Button {
             id: fetchBranchButton
-            text: "🔄 Fetch"
+            text: root.busy && root.panelAction === "fetch" ? "⏳ Fetching…" : "🔄 Fetch"
             fontSize: Style.font.caption
             bordered: true
             enabled: !root.busy && root.selectedRepoData && root.selectedRepoData.state !== "missing"
@@ -626,7 +727,11 @@ BarWidget {
             id: closeOverlayButton
             text: "✕"
             fontSize: Style.font.caption
-            onClicked: root.branchOverlayOpen = false
+            onClicked: {
+              root.branchOverlayOpen = false
+              root.overlayMessage = ""
+              root.overlayError = ""
+            }
           }
         }
 
@@ -636,6 +741,17 @@ BarWidget {
           visible: root.selectedRepoData && (!root.selectedRepoData.eligible || root.selectedRepoData.state === "missing")
           text: "Branch switch unavailable: " + (root.selectedRepoData ? (root.selectedRepoData.ineligibleReason || "Repository must be clean") : "")
           color: Color.urgent
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.Wrap
+        }
+
+        // Сообщение о результате Fetch (оверлея перекрывает общий summary/error панели)
+        Text {
+          width: parent.width
+          visible: root.overlayError !== "" || root.overlayMessage !== ""
+          text: root.overlayError !== "" ? root.overlayError : root.overlayMessage
+          color: root.overlayError !== "" ? Color.urgent : Color.accent
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
           wrapMode: Text.Wrap
@@ -723,7 +839,7 @@ BarWidget {
       anchors.fill: parent
       z: 10
       opened: root.vpnConfirmOpen
-      message: "FALT VPN is off. Turn it on and continue with " + root.actionLabel(root.pendingAction) + "?"
+      message: "VPN " + root.vpnConnection + " is off. Turn it on and continue with " + root.actionLabel(root.pendingAction) + "?"
       cancelText: "Cancel"
       confirmText: "Turn on"
       background: Color.popups.background
