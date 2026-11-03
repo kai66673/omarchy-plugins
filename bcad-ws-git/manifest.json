@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "kai.git-status",
   "name": "BCAD workspace",
-  "version": "2.0.0",
+  "version": "2.3.0",
   "author": "kai",
   "description": "Shows status of the BCAD multi-repo workspace and provides status, branches, pull, and push actions",
   "kinds": [
@@ -43,6 +43,20 @@
         "defaultValue": "FALT",
         "label": "VPN connection",
         "description": "NetworkManager connection name used for pull/push; empty disables VPN handling"
+      },
+      {
+        "key": "diffTerminal",
+        "type": "string",
+        "defaultValue": "auto",
+        "label": "Diff terminal",
+        "description": "Terminal used for the diff window when clicking a dirty repo in Status: auto picks kitty, foot, alacritty or xterm; or set a terminal command available in PATH"
+      },
+      {
+        "key": "diffWindowSize",
+        "type": "string",
+        "defaultValue": "1400x900",
+        "label": "Diff window size",
+        "description": "Floating diff window size as WIDTHxHEIGHT pixels; centered on the current monitor (Hyprland)"
       }
     ]
   }

@@ -68,6 +68,11 @@ BarWidget {
   property string overlayMessage: ""
   property string overlayError: ""
 
+  // Терминал для окна diff незакоммиченных изменений ("auto" = kitty/foot/alacritty/xterm)
+  property string diffTerminal: String(setting("diffTerminal", "auto"))
+  // Размер floating-окна diff (WIDTHxHEIGHT), центрируется на текущем мониторе
+  property string diffWindowSize: String(setting("diffWindowSize", "1400x900"))
+
   readonly property string barText: {
     if (root.vertical) return icon
       if (statusError !== "") return icon + " !"
@@ -136,6 +141,19 @@ BarWidget {
       branchProcess.command = ["python3", root.scriptPath, "switch-branch", root.workspacePath, dest, name, create ? "create" : "switch"]
       branchProcess.running = true
       branchOverlayOpen = false // Закрываем оверлей после запуска команды
+  }
+
+  function openDiff(repoData) {
+    if (repoData) openDiffDest(String(repoData.dest || ""))
+  }
+
+  // Diff незакоммиченных изменений — в отдельном оконном терминале.
+  // Запускается стандартный git diff, и git сам подключает настроенный
+  // пейджер (git-delta), так как stdout терминала является tty.
+  function openDiffDest(dest) {
+    if (diffTermProcess.running || dest === "") return
+    diffTermProcess.command = ["python3", root.scriptPath, "diff-term", root.workspacePath, dest, root.diffTerminal, root.diffWindowSize]
+    diffTermProcess.running = true
   }
 
   function requestNetworkAction(action, arg) {
@@ -281,6 +299,7 @@ BarWidget {
     function pull(): void { root.requestNetworkAction("pull") }
     function push(): void { root.requestNetworkAction("push") }
     function fetch(dest: string): void { root.runFetch(dest) }
+    function diff(dest: string): void { root.openDiffDest(dest) }
     function cancelVpn(): void { root.cancelVpnConfirm() }
     function confirmVpn(): void { root.connectVpn() }
     function state(): string {
@@ -362,6 +381,27 @@ BarWidget {
       }
       root.applyActionResult(data)
       if (!data.error) root.refresh()
+    }
+  }
+  Process {
+    id: diffTermProcess
+    stdout: StdioCollector { id: diffTermStdout; waitForEnd: true }
+    stderr: StdioCollector { id: diffTermStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        root.panelError = diffTermStderr.text.trim() || "workspace.py failed"
+        return
+      }
+      var data = root.parseOutput(diffTermStdout.text)
+      if (!data) {
+        root.panelError = "could not parse diff-term output"
+        return
+      }
+      if (data.error) {
+        root.panelError = String(data.error)
+        return
+      }
+      if (data.reason === "no uncommitted changes") refresh()
     }
   }
   Process {
@@ -651,6 +691,10 @@ BarWidget {
                     Qt.callLater(function() {
                       overlayNewBranchField.forceActiveFocus();
                     });
+                  } else if (root.panelAction === "status"
+                             && (modelData.state === "modified" || modelData.state === "untracked")) {
+                    // Клик по репозиторию с незакоммиченными изменениями — открываем diff
+                    root.openDiff(modelData)
                   }
                 }
               }
@@ -668,6 +712,15 @@ BarWidget {
             }
           }
         }
+      }
+      Text {
+        width: parent.width
+        visible: root.panelAction === "status" && !root.busy && (root.dirtyCount > 0 || root.untrackedCount > 0)
+        text: "Клик по репозиторию с изменениями — diff в отдельном окне терминала"
+        color: Qt.darker(Color.foreground, 1.8)
+        font.family: Style.font.family
+        font.pixelSize: Style.font.caption * 0.9
+        horizontalAlignment: Text.AlignHCenter
       }
     }
     // Оверлей для управления ветками конкретного репозитория

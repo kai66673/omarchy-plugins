@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
+import time
 
 DEFAULT_WORKSPACE = os.path.expanduser("~/BAS/bcad-ws")
 DEFAULT_BRANCH = "main"
 GIT_TIMEOUT = 10
 NETWORK_TIMEOUT = 180
+TERMINAL_CANDIDATES = ("kitty", "foot", "alacritty", "xterm")
+DEFAULT_DIFF_SIZE = (1400, 900)
+DIFF_WINDOW_CLASS = "git-diff"
 
 
 def git_env():
@@ -384,6 +390,238 @@ def action_fetch(workspace, repos, dest):
     return result
 
 
+def pick_terminal(choice):
+    # choice: "auto" или имя/путь терминала из настройки плагина
+    choice = (choice or "").strip()
+    if choice and choice != "auto":
+        return shutil.which(choice)
+    # $TERMINAL может указывать на xdg-terminal-exec — он не принимает
+    # "--title ... -- cmd" и молча не запускает команду, поэтому он не в счёт
+    env_terminal = os.environ.get("TERMINAL", "").strip()
+    if env_terminal and "terminal-exec" in os.path.basename(env_terminal):
+        env_terminal = ""
+    order = ([env_terminal] if env_terminal else []) + list(TERMINAL_CANDIDATES)
+    for name in order:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def parse_size(spec, default=DEFAULT_DIFF_SIZE):
+    # "1400x900" → (1400, 900); некорректное значение → default
+    try:
+        w, h = str(spec).lower().replace("*", "x").split("x")
+        w, h = int(w), int(h)
+        if 200 <= w <= 8000 and 100 <= h <= 5000:
+            return (w, h)
+    except (TypeError, ValueError):
+        pass
+    return default
+
+
+def terminal_argv(terminal, title, shell_cmd, size=None):
+    # --class/-a git-diff: окно помечается классом, под который Hyprland
+    # заранее ставит rule (float/размер/центр) — окно появляется сразу
+    # финального размера, и пейджер git (delta) рендерит корректно.
+    if terminal.endswith("kitty"):
+        argv = [terminal, "--class", DIFF_WINDOW_CLASS]
+        if size:
+            argv += ["--override", f"initial_window_width={size[0]}",
+                     "--override", f"initial_window_height={size[1]}"]
+        return argv + ["--title", title, "-e", "sh", "-c", shell_cmd]
+    if terminal.endswith("alacritty"):
+        return [terminal, "--title", title, "--class", DIFF_WINDOW_CLASS, "-e", "sh", "-c", shell_cmd]
+    if terminal.endswith("xterm"):
+        return [terminal, "-name", DIFF_WINDOW_CLASS, "-class", DIFF_WINDOW_CLASS,
+                "-title", title, "-e", "sh", "-c", shell_cmd]
+    if terminal.endswith("foot"):
+        argv = [terminal, "--title", title, "-a", DIFF_WINDOW_CLASS]
+        if size:
+            # -w задаёт начальный размер в пикселях ещё до появления окна
+            argv += ["-w", f"{size[0]}x{size[1]}"]
+        return argv + ["--", "sh", "-c", shell_cmd]
+    # прочие терминалы: разделитель "--" и команда с аргументами
+    return [terminal, "--title", title, "--", "sh", "-c", shell_cmd]
+
+
+def hypr_json(args):
+    # Запрос JSON к Hyprland; None, если Hyprland недоступен
+    hyprctl = shutil.which("hyprctl")
+    if hyprctl is None or not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return None
+    try:
+        proc = subprocess.run([hyprctl] + args, capture_output=True,
+                              text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        return None
+
+
+def clamp_size(size):
+    # не выпускать окно за рабочую область текущего монитора
+    monitors = hypr_json(["-j", "monitors"]) or []
+    mon = next((m for m in monitors if m.get("focused")), None)
+    if not mon:
+        return size
+    reserved = mon.get("reserved") or [0, 0, 0, 0]
+    avail_w = int(mon.get("width", 0)) - int(reserved[0]) - int(reserved[2]) - 40
+    avail_h = int(mon.get("height", 0)) - int(reserved[1]) - int(reserved[3]) - 40
+    w, h = size
+    return (max(400, min(w, avail_w)), max(200, min(h, avail_h)))
+
+
+def hypr_float_rule(width, height):
+    # Hyprland (Lua-API через hyprctl eval): оконное правило, по которому окна
+    # класса git-diff становятся floating и центрируются УЖЕ при появлении,
+    # до первого вывода git diff. Глобал в Lua-стейте хранит последний
+    # применённый размер: при неизменном настройке правило не дублируется,
+    # при смене размера регистрируется новое (Hyprland применяет последним
+    # зарегистрированное подходящее правило).
+    hyprctl = shutil.which("hyprctl")
+    if hyprctl is None or not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return False
+    lua = (
+        "_kai_git_diff_rules = _kai_git_diff_rules or {} "
+        f'local key = "{width}x{height}" '
+        "if _kai_git_diff_last ~= key then "
+        f"_kai_git_diff_rules[key] = hl.window_rule({{match = {{class = '^{DIFF_WINDOW_CLASS}$'}}, "
+        f"float = true, center = true, size = {{{width}, {height}}}}}) "
+        "_kai_git_diff_last = key "
+        "end"
+    )
+    try:
+        proc = subprocess.run([hyprctl, "eval", lua], capture_output=True,
+                              text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def float_hypr_window(title, width, height):
+    # Запасной путь (если правило не зарегистрировалось): подгонка уже
+    # созданного окна диспетчерами float/resize/center. Минус — терминал
+    # сначала маппится в тайле, и вывод может перекосить.
+    clients = hypr_json(["-j", "clients"]) or []
+    addr = None
+    for _ in range(40):  # окно появляется за ~200-400 мс, ждём до 4 с
+        matches = [c for c in clients if (c.get("title") or "") == title]
+        if matches:
+            addr = matches[-1].get("address")
+            break
+        time.sleep(0.1)
+        clients = hypr_json(["-j", "clients"]) or []
+    if not addr:
+        return False
+    hyprctl = shutil.which("hyprctl")
+    lua = (
+        'local sel = "address:' + str(addr) + '" '
+        "local a = hl.dispatch(hl.dsp.window.float({window = sel})) "
+        f"local b = hl.dispatch(hl.dsp.window.resize({{window = sel, x = {width}, y = {height}}})) "
+        "local c = hl.dispatch(hl.dsp.window.center({window = sel})) "
+        'if not (a and a.ok and b and b.ok and c and c.ok) then error("hypr adjust failed") end'
+    )
+    try:
+        proc = subprocess.run([hyprctl, "eval", lua], capture_output=True,
+                              text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def action_diff_term(workspace, repos, dest, terminal_choice, size_spec=""):
+    result = {
+        "action": "diff-term",
+        "ok": False,
+        "dest": dest,
+        "spawned": False,
+        "terminal": "",
+        "reason": "",
+        "summary": "",
+        "error": None,
+    }
+
+    target = next((repo for repo in repos if repo["dest"] == dest), None)
+    if target is None:
+        result["error"] = "repository not found: " + dest
+        return result
+
+    path = repo_path(workspace, dest)
+    row = inspect_repo(path)
+    if row["state"] == "missing":
+        result["error"] = "package directory not found: " + dest
+        return result
+    if row["state"] == "error":
+        result["error"] = row["detail"] or "repository unavailable"
+        return result
+
+    code, out, _ = run_git(path, ["status", "--porcelain", "--untracked-files=normal"])
+    if code != 0:
+        result["error"] = "git status failed"
+        return result
+    lines = [line for line in out.splitlines() if line.strip()]
+    if not lines:
+        result["ok"] = True
+        result["reason"] = "no uncommitted changes"
+        result["summary"] = "No uncommitted changes in " + dest
+        return result
+
+    terminal = pick_terminal(terminal_choice)
+    if terminal is None:
+        result["error"] = "no terminal found (kitty/foot/alacritty/xterm)"
+        return result
+    result["terminal"] = terminal
+
+    # Стандартный git diff: git сам запустит настроенный пейджер (git-delta),
+    # так как stdout терминала — tty. git diff HEAD охватывает и индексированные
+    # изменения. Для репозитория без коммитов HEAD нет — откат на git diff.
+    path_q = shlex.quote(path)
+    diff_cmd = f"git -C {path_q} diff HEAD || git -C {path_q} diff"
+    has_tracked = any(not line.startswith("??") for line in lines)
+    if has_tracked:
+        shell_cmd = diff_cmd
+    else:
+        # только untracked файлы: diff пуст, показываем git status и держим окно
+        shell_cmd = (
+            f"git -C {path_q} status --short --branch; "
+            "printf '\\nOnly untracked files:\\n'; "
+            f"git -C {path_q} ls-files --others --exclude-standard; "
+            "printf '\\nPress Enter to close...\\n'; read -r _ < /dev/tty"
+        )
+
+    title = f"git diff - {dest}"
+    size = clamp_size(parse_size(size_spec) if size_spec else DEFAULT_DIFF_SIZE)
+    # правило окон ставится до запуска терминала, чтобы окно появилось сразу
+    # floating-ного размера и git diff/delta рендерились без перекосов
+    ruled = hypr_float_rule(size[0], size[1])
+    argv = terminal_argv(terminal, title, shell_cmd, size)
+    try:
+        subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        result["error"] = "could not launch terminal: " + str(exc)
+        return result
+
+    if ruled:
+        result["floating"] = True
+    else:
+        result["floating"] = float_hypr_window(title, size[0], size[1])
+    result["spawned"] = True
+    result["ok"] = True
+    result["summary"] = "Diff window for " + dest
+    return result
+
+
 def action_network(workspace, repos, action):
     rows = []
     ok_count = failed = missing = 0
@@ -482,6 +720,14 @@ def main():
         result.update(action_status(workspace, repos))
     elif action == "branches":
         result.update(action_branches(workspace, repos))
+    elif action == "diff-term":
+        if len(sys.argv) < 4:
+            result["error"] = "usage: diff-term <workspace> <dest> [terminal] [WIDTHxHEIGHT]"
+        else:
+            terminal_choice = sys.argv[4] if len(sys.argv) > 4 else "auto"
+            size_spec = sys.argv[5] if len(sys.argv) > 5 else ""
+            result.update(action_diff_term(workspace, repos, sys.argv[3],
+                                           terminal_choice, size_spec))
     elif action == "fetch":
         if len(sys.argv) < 4:
             result["error"] = "usage: fetch <workspace> <dest>"
