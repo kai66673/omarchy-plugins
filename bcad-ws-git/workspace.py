@@ -23,7 +23,7 @@ def run_git(path, args, timeout=GIT_TIMEOUT):
     try:
         proc = subprocess.run(
             ["git", "-C", path] + args,
-            capture_output=True,
+            check=False, capture_output=True,
             text=True,
             timeout=timeout,
             env=git_env(),
@@ -41,7 +41,7 @@ def read_repos(workspace):
         data = json.load(handle)
 
     if not isinstance(data, list):
-        raise ValueError("packages.json must be an array")
+        raise TypeError("packages.json must be an array")
 
     repos = []
     for item in data:
@@ -91,7 +91,7 @@ def inspect_repo(path):
     if code == 0 and out:
         row["currentRef"] = out
         prefix = "refs/heads/"
-        row["branch"] = out[len(prefix):] if out.startswith(prefix) else out
+        row["branch"] = out.removeprefix(prefix)
     else:
         code, out, _ = run_git(path, ["rev-parse", "--short", "HEAD"])
         row["branch"] = out or "(detached)"
@@ -170,9 +170,9 @@ def action_status(workspace, repos):
                 row["untracked"] = untracked
 
                 if tracked > 0:
-                    label = "Modified ({})".format(tracked)
+                    label = f"Modified ({tracked})"
                     if untracked > 0:
-                        label += " · {} untracked".format(untracked)
+                        label += f" · {untracked} untracked"
                     row.update(state="modified", label=label)
                     dirty += 1
                 elif untracked > 0:
@@ -182,7 +182,7 @@ def action_status(workspace, repos):
                         detail += " …"
                     row.update(
                         state="untracked",
-                        label="Up to date · {} untracked".format(untracked),
+                        label=f"Up to date · {untracked} untracked",
                         detail=detail,
                     )
                     untracked_count += 1
@@ -193,16 +193,16 @@ def action_status(workspace, repos):
 
     parts = []
     if dirty:
-        parts.append("{} modified".format(dirty))
+        parts.append(f"{dirty} modified")
     if untracked_count:
-        parts.append("{} untracked".format(untracked_count))
+        parts.append(f"{untracked_count} untracked")
     if missing:
-        parts.append("{} missing".format(missing))
+        parts.append(f"{missing} missing")
     if errors:
-        parts.append("{} errors".format(errors))
+        parts.append(f"{errors} errors")
     clean = len(repos) - dirty - untracked_count - missing - errors
     if clean > 0:
-        parts.append("{} up to date".format(clean))
+        parts.append(f"{clean} up to date")
 
     return {
         "ok": dirty == 0 and untracked_count == 0 and missing == 0 and errors == 0,
@@ -257,14 +257,14 @@ def action_branches(workspace, repos):
 
     parts = []
     if mismatched:
-        parts.append("{} on unexpected branch".format(mismatched))
+        parts.append(f"{mismatched} on unexpected branch")
     if missing:
-        parts.append("{} missing".format(missing))
+        parts.append(f"{missing} missing")
     if errors:
-        parts.append("{} errors".format(errors))
+        parts.append(f"{errors} errors")
     ok = len(repos) - mismatched - missing - errors
     if ok > 0:
-        parts.append("{} on expected branch".format(ok))
+        parts.append(f"{ok} on expected branch")
     return {
         "ok": mismatched == 0 and missing == 0 and errors == 0,
         "summary": " · ".join(parts) if parts else "No repositories",
@@ -326,7 +326,7 @@ def action_switch_branch(workspace, repos, dest, branch, create):
             return switch_branch_error(
                 workspace, repos, err or "could not create branch"
             )
-        notice = "Created {} in {}".format(branch, dest)
+        notice = f"Created {branch} in {dest}"
     else:
         # 1. Проверяем, существует ли ветка локально
         code_local, _, _ = run_git(path, ["show-ref", "--verify", "--quiet", "refs/heads/" + branch])
@@ -356,7 +356,7 @@ def action_switch_branch(workspace, repos, dest, branch, create):
             return switch_branch_error(
                 workspace, repos, err or "could not switch branch"
             )
-        notice = "Switched {} to {}".format(dest, branch)
+        notice = f"Switched {dest} to {branch}"
 
     result = action_branches(workspace, repos)
     summary = notice
@@ -417,12 +417,12 @@ def action_network(workspace, repos, action):
         args = ["push", "origin", branch] if action == "push" else ["pull", "--no-edit", "origin", branch]
         code, out, err = run_git(path, args, timeout=NETWORK_TIMEOUT)
         if code == 0:
-            row.update(state="ok", label="{} - Ok".format(branch), detail=out)
+            row.update(state="ok", label=f"{branch} - Ok", detail=out)
             ok_count += 1
         else:
             row.update(
                 state="failed",
-                label="{} - Failed".format(branch),
+                label=f"{branch} - Failed",
                 detail=err or out or "git command failed",
             )
             failed += 1
@@ -431,11 +431,11 @@ def action_network(workspace, repos, action):
 
     parts = []
     if ok_count:
-        parts.append("{} ok".format(ok_count))
+        parts.append(f"{ok_count} ok")
     if failed:
-        parts.append("{} failed".format(failed))
+        parts.append(f"{failed} failed")
     if missing:
-        parts.append("{} missing".format(missing))
+        parts.append(f"{missing} missing")
 
     return {
         "ok": failed == 0 and missing == 0,
