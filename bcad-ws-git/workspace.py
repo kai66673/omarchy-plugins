@@ -581,7 +581,8 @@ def action_diff_term(workspace, repos, dest, terminal_choice, size_spec=""):
     # так как stdout терминала — tty. git diff HEAD охватывает и индексированные
     # изменения. Для репозитория без коммитов HEAD нет — откат на git diff.
     path_q = shlex.quote(path)
-    diff_cmd = f"git -C {path_q} diff HEAD || git -C {path_q} diff"
+    # diff_cmd = f"git -C {path_q} diff HEAD || git -C {path_q} diff"
+    diff_cmd = "lazygit"
     has_tracked = any(not line.startswith("??") for line in lines)
     if has_tracked:
         shell_cmd = diff_cmd
@@ -607,6 +608,7 @@ def action_diff_term(workspace, repos, dest, terminal_choice, size_spec=""):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            cwd=path_q,
         )
     except OSError as exc:
         result["error"] = "could not launch terminal: " + str(exc)
